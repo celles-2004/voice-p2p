@@ -63,6 +63,8 @@ async def run_client(args, stop_event):
 
     peers = []
 
+    chat_send_q = queue.Queue()
+
     async with aiohttp.ClientSession() as session:
         async with session.ws_connect(args.server) as ws:
 
@@ -73,6 +75,19 @@ async def run_client(args, stop_event):
                 'udp_port': local_port
             })
 
+            async def chat_sender():
+                while True:
+                    text = await asyncio.get_event_loop().run_in_executor(None, chat_send_q.get)
+                    print("PEER SEND:", text)
+                    if text is None:
+                        break
+                    await ws.send_json({
+                        'type': 'chat',
+                        'text': text
+                    })
+
+            asyncio.create_task(chat_sender())
+
             async for msg in ws:
                 if msg.type != aiohttp.WSMsgType.TEXT:
                     continue
@@ -82,6 +97,12 @@ async def run_client(args, stop_event):
                 if data.get('type') == 'peers' and data.get('peers'):
                     peers = data['peers']
                     break
+
+                elif data.get('type') == 'chat':
+                    print(f"[CHAT {data['from']}]: {data['text']}")
+                    print("PEER RECV CHAT:", data)
+                    if chat_recv_cb:
+                        chat_recv_cb(data['from'], data['text'])
 
     if not peers:
         print("No peers found")
@@ -177,7 +198,9 @@ def start_peer(
     bind_port,
     input_device,
     output_device,
-    stop_event
+    stop_event,
+    chat_recv_cb=None,
+    chat_send_q=None
 ):
     class Args:
         pass

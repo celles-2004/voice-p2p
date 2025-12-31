@@ -95,6 +95,20 @@ class ServerGUI(tk.Tk):
         self.client_id_var = tk.StringVar(value='peer1')
         tk.Entry(client_frame, textvariable=self.client_id_var, width=12).grid(row=1, column=3, sticky='w')
 
+        # Chat UI
+        tk.Label(self, text="chat").pack(anchor='w', padx=8)
+
+        self.chat_box = scrolledtext.ScrolledText(self, height=6, state='disabled')
+        self.chat_box.pack(fill='x', padx=8)
+
+        chat_frame = tk.Frame(self)
+        chat_frame.pack(fill='x', padx=8, pady=4)
+
+        self.chat_entry = tk.Entry(chat_frame)
+        self.chat_entry.pack(side='left', fill='x', expand=True)
+
+        tk.Button(chat_frame, text='Send', command=self._send_chat).pack(side='left', padx=4)   
+
         # Mic selection
         tk.Label(client_frame, text='Mic:').grid(row=2, column=0, sticky='w')
 
@@ -303,6 +317,7 @@ class ServerGUI(tk.Tk):
     
     def start_peer_process(self):
         self.peer_stop_event = threading.Event()
+        self.chat_send_q = queue.Queue()
     
         server_ip = self.client_server_ip_var.get().strip()
         server_port = self.client_server_port_var.get().strip()
@@ -318,7 +333,9 @@ class ServerGUI(tk.Tk):
                 self.client_bind_port_var.get(),
                 self.input_dev_map.get(self.input_dev_var.get()),
                 self.output_dev_map.get(self.output_dev_var.get()),
-                self.peer_stop_event
+                self.peer_stop_event,
+                self.on_chat_recv,
+                self.chat_send_q
             )
         )
         self.peer_thread.start()
@@ -357,6 +374,26 @@ class ServerGUI(tk.Tk):
         self.log_box.insert('end', text)
         self.log_box.see('end')
         self.log_box.config(state='disabled')
+
+    # send chat message
+    def _send_chat(self):
+        msg = self.chat_entry.get().strip()
+        print(f"Sending chat: {msg}")
+        if not msg:
+            return
+        self.chat_entry.delete(0, 'end')
+        self.chat_send_q.put(msg)
+        self.append_chat(f"[me]: {msg}\n")
+
+    def on_chat_recv(self, sender, text):
+        print("GUI CHAT:", sender, text)
+        self.append_chat(f"{sender}: {text}\n")
+        
+    def append_chat(self, text):
+        self.chat_box.config(state='normal')
+        self.chat_box.insert('end', text)
+        self.chat_box.see('end')
+        self.chat_box.config(state='disabled')
 
 if __name__ == '__main__':
     app = ServerGUI()

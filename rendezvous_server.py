@@ -35,6 +35,18 @@ async def websocket_handler(request):
                     await notify_room(room)
                 elif t == 'list':
                     await ws.send_json({'type': 'rooms', 'rooms': list(rooms.keys())})
+                elif t == 'chat':
+                    print("SERVER CHAT:", peer["id"], data.get("text"))
+                    room = peer['room']
+                    msg = {
+                        'type': 'chat',
+                        'from': peer['id'],
+                        'text': data.get('text', '')
+                    }
+
+                    for p in rooms.get(room, []):
+                        if p is not peer:
+                            await p['ws'].send_json(msg)
                 else:
                     await ws.send_json({'type': 'error', 'message': 'unknown type'})
             elif msg.type == WSMsgType.ERROR:
