@@ -48,7 +48,7 @@ class PlaybackBuffer:
         except queue.Empty:
             outdata.fill(0)
 
-async def run_client(args, stop_event):
+async def run_client(args, stop_event, chat_recv_cb=None, chat_send_q=None):
     # log
     print("INPUT DEVICE:", args.input_device)
     print("OUTPUT DEVICE:", args.output_device)
@@ -63,7 +63,9 @@ async def run_client(args, stop_event):
 
     peers = []
 
-    chat_send_q = queue.Queue()
+    # Use provided queue or create a new one
+    if chat_send_q is None:
+        chat_send_q = queue.Queue()
 
     async with aiohttp.ClientSession() as session:
         async with session.ws_connect(args.server) as ws:
@@ -86,7 +88,7 @@ async def run_client(args, stop_event):
                         'text': text
                     })
 
-            asyncio.create_task(chat_sender())
+            chat_sender_task = asyncio.create_task(chat_sender())
 
             async for msg in ws:
                 if msg.type != aiohttp.WSMsgType.TEXT:
@@ -100,9 +102,12 @@ async def run_client(args, stop_event):
 
                 elif data.get('type') == 'chat':
                     print(f"[CHAT {data['from']}]: {data['text']}")
-                    print("PEER RECV CHAT:", data)
                     if chat_recv_cb:
                         chat_recv_cb(data['from'], data['text'])
+
+            # Cancel chat sender task
+            chat_send_q.put(None)
+            await chat_sender_task
 
     if not peers:
         print("No peers found")
@@ -141,7 +146,6 @@ async def run_client(args, stop_event):
     )
     in_stream.start()
 
-
     # Start a thread to receive UDP packets and push to playback
     def udp_recv_loop(s: socket.socket, playback_buf: PlaybackBuffer):
         while True:
@@ -158,7 +162,6 @@ async def run_client(args, stop_event):
     for i in range(6):
         sock.sendto(b'PING', target)
 
-
     print('Streaming audio. Press Ctrl-C to quit.')
     try:
         while not stop_event.is_set():
@@ -167,8 +170,10 @@ async def run_client(args, stop_event):
         pass
     finally:
         send_q.put(None)
-        in_stream.stop()
-        out_stream.stop()
+        if in_stream:
+            in_stream.stop()
+        if out_stream:
+            out_stream.stop()
         sock.close()
 
 
@@ -202,9 +207,10 @@ def start_peer(
     chat_recv_cb=None,
     chat_send_q=None
 ):
+    # Create arguments for the client
     class Args:
         pass
-
+    
     args = Args()
     args.server = server_url
     args.room = room
@@ -214,9 +220,21 @@ def start_peer(
     args.input_device = input_device
     args.output_device = output_device
 
-    asyncio.run(run_client(args, stop_event))
+    # Function to run in a separate thread
+    def run_peer():
+        # Create a function for the chat callback
+        def local_chat_recv(sender, text):
+            if chat_recv_cb:
+                chat_recv_cb(sender, text)
+
+        # Run the client
+        asyncio.run(run_client(args, stop_event, chat_recv_cb=local_chat_recv, chat_send_q=chat_send_q))
+    
+    # Run in a separate thread
+    peer_thread = threading.Thread(target=run_peer, daemon=True)
+    peer_thread.start()
+    return peer_thread
 
 
 if __name__ == '__main__':
     main()
-

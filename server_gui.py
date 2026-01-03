@@ -9,6 +9,7 @@ import sounddevice as sd
 from tkinter import scrolledtext, messagebox
 from peer import start_peer
 import threading
+import subprocess
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SERVER_SCRIPT = os.path.join(SCRIPT_DIR, 'rendezvous_server.py')
