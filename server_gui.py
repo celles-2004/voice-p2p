@@ -67,17 +67,17 @@ class ServerGUI(tk.Tk):
             messagebox.showerror("Audio error", str(e))
 
         # maps: name -> index
-        self.input_dev_map = {
-            d['name']: i
-            for i, d in enumerate(self.sd_devices)
-            if d.get('max_input_channels', 0) > 0
-        }
-
-        self.output_dev_map = {
-            d['name']: i
-            for i, d in enumerate(self.sd_devices)
-            if d.get('max_output_channels', 0) > 0
-        }
+        self.input_dev_map = {}
+        for i, d in enumerate(self.sd_devices):
+            if d.get('max_input_channels', 0) > 0:
+                rate = d.get('default_samplerate', 'N/A')
+                self.input_dev_map[f"{d['name']} ({rate} Hz)"] = i
+        
+        self.output_dev_map = {}
+        for i, d in enumerate(self.sd_devices):
+            if d.get('max_output_channels', 0) > 0:
+                rate = d.get('default_samplerate', 'N/A')
+                self.output_dev_map[f"{d['name']} ({rate} Hz)"] = i
 
         self.client_process = None
 
@@ -376,7 +376,7 @@ class ServerGUI(tk.Tk):
         self.log_box.see('end')
         self.log_box.config(state='disabled')
 
-    # send chat message
+    # Отправка сообщение
     def _send_chat(self):
         msg = self.chat_entry.get().strip()
         print(f"Sending chat: {msg}")
@@ -389,6 +389,7 @@ class ServerGUI(tk.Tk):
     def on_chat_recv(self, sender, text):
         print("GUI CHAT:", sender, text)
         self.append_chat(f"{sender}: {text}\n")
+
         
     def append_chat(self, text):
         self.chat_box.config(state='normal')

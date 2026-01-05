@@ -88,13 +88,13 @@ async def run_client(args, stop_event, chat_recv_cb=None, chat_send_q=None):
     print(f"OUTPUT DEVICE: {args.output_device}, SAMPLE RATE: {output_sample_rate} Hz")
     print(f"USING SAMPLE RATE: {sample_rate} Hz")
 
-    # create UDP socket
+    # Создать UDP сокет
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((args.bind_ip, args.bind_port))
     local_port = sock.getsockname()[1]
     
-    # register with rendezvous server and get peers
-    print('Waiting for peer... (keep this client running until another joins)')
+    # Ожидание и регистрация пиров.
+    print('Ожидание пиров)')
 
     peers = []
 
@@ -125,91 +125,123 @@ async def run_client(args, stop_event, chat_recv_cb=None, chat_send_q=None):
 
             chat_sender_task = asyncio.create_task(chat_sender())
 
-            async for msg in ws:
-                if msg.type != aiohttp.WSMsgType.TEXT:
-                    continue
+            # Флаг для отслеживание, получили ли мы пиров
+            got_peers = False
 
-                data = json.loads(msg.data)
+            async def message_handler():
+                nonlocal got_peers, peers
+                async for msg in ws:
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        continue
 
-                if data.get('type') == 'peers' and data.get('peers'):
-                    peers = data['peers']
-                    break
+                    data = json.loads(msg.data)
 
-                elif data.get('type') == 'chat':
-                    print(f"[CHAT {data['from']}]: {data['text']}")
-                    if chat_recv_cb:
-                        chat_recv_cb(data['from'], data['text'])
+                    if data.get('type') == 'peers' and data.get('peers'):
+                        peers = data['peers']
+                        got_peers = True
+                        print(f"Есть пиры: {peers}")
+                        # Не выходим из цикла, продолжаем слушать сообщения
 
-            # Cancel chat sender task
-            chat_send_q.put(None)
-            await chat_sender_task
+                    elif data.get('type') == 'chat':
+                        print(f"[CHAT {data['from']}]: {data['text']}")
+                        if chat_recv_cb:
+                            chat_recv_cb(data['from'], data['text'])
 
-    if not peers:
-        print("No peers found")
-        return
+            # Запускаем обработчик сообщений
+            message_handler_task = asyncio.create_task(message_handler())
+
+            # Ждем, пока получим пиры
+            while not got_peers and not stop_event.is_set():
+                await asyncio.sleep(0.1)
+
+            if stop_event.is_set():
+                # Отменяем задачи и выходим
+                chat_send_q.put(None)
+                message_handler_task.cancel()
+                await chat_sender_task
+                return
+
+            if not peers:
+                print("No peers found")
+                chat_send_q.put(None)
+                message_handler_task.cancel()
+                await chat_sender_task
+                return
     
-    # use first peer
-    peer = peers[0]
-    target = (peer['ip'], int(peer['udp_port']))
-    print(f'Peer discovered: {target}, starting hole-punching')
+            # use first peer
+            peer = peers[0]
+            target = (peer['ip'], int(peer['udp_port']))
+            print(f'Peer discovered: {target}, starting hole-punching')
 
-    # Start sender thread
-    send_q = queue.Queue()
-    sender_thread = threading.Thread(target=udp_sender_loop, args=(sock, target, send_q), daemon=True)
-    sender_thread.start()
+            # Start sender thread
+            send_q = queue.Queue()
+            sender_thread = threading.Thread(target=udp_sender_loop, args=(sock, target, send_q), daemon=True)
+            sender_thread.start()
 
-    # Playback buffer and output stream
-    playback = PlaybackBuffer()
-    out_stream = sd.OutputStream(
-        samplerate=sample_rate,  # Используем рассчитанную частоту
-        channels=CHANNELS,
-        dtype=DTYPE,
-        blocksize=FRAME_SIZE,
-        device=args.output_device,
-        callback=lambda outdata, frames, time, status: playback.write(outdata)
-    )
-    out_stream.start()
+            # Playback buffer and output stream
+            playback = PlaybackBuffer()
+            out_stream = sd.OutputStream(
+                samplerate=sample_rate,  # Используем рассчитанную частоту
+                channels=CHANNELS,
+                dtype=DTYPE,
+                blocksize=FRAME_SIZE,
+                device=args.output_device,
+                callback=lambda outdata, frames, time, status: playback.write(outdata)
+            )
+            out_stream.start()
 
-    in_stream = sd.InputStream(
-        samplerate=sample_rate,  # Используем рассчитанную частоту
-        channels=CHANNELS,
-        dtype=DTYPE,
-        blocksize=FRAME_SIZE,
-        device=args.input_device,
-        callback=lambda indata, frames, time, status:
-            audio_input_callback(indata.copy(), frames, time, status, send_q)
-    )
-    in_stream.start()
+            in_stream = sd.InputStream(
+                samplerate=sample_rate,  # Используем рассчитанную частоту
+                channels=CHANNELS,
+                dtype=DTYPE,
+                blocksize=FRAME_SIZE,
+                device=args.input_device,
+                callback=lambda indata, frames, time, status:
+                    audio_input_callback(indata.copy(), frames, time, status, send_q)
+            )
+            in_stream.start()
 
-    # Start a thread to receive UDP packets and push to playback
-    def udp_recv_loop(s: socket.socket, playback_buf: PlaybackBuffer):
-        while True:
+            # Start a thread to receive UDP packets and push to playback
+            def udp_recv_loop(s: socket.socket, playback_buf: PlaybackBuffer):
+                while True:
+                    try:
+                        data, addr = s.recvfrom(65536)
+                        playback_buf.q.put(data)
+                    except Exception:
+                        break
+                    
+            recv_thread = threading.Thread(target=udp_recv_loop, args=(sock, playback), daemon=True)
+            recv_thread.start()
+
+            # Do hole-punching: send some empty packets to peer to open NAT bindings
+            for i in range(6):
+                sock.sendto(b'PING', target)
+
+            print('Streaming audio. Press Ctrl-C to quit.')
+
+            # Основной цикл - работает пока не будет остановки
             try:
-                data, addr = s.recvfrom(65536)
-                playback_buf.q.put(data)
-            except Exception:
-                break
+                while not stop_event.is_set():
+                    await asyncio.sleep(0.2)
+            except KeyboardInterrupt:
+                pass
+            finally:
+                # Отменяем задачи
+                message_handler_task.cancel()
+                chat_send_q.put(None)
+                # Ждем завершение задач
+                try:
+                    await asyncio.gather(chat_sender_task, return_exceptions=True)
+                except:
+                    pass
 
-    recv_thread = threading.Thread(target=udp_recv_loop, args=(sock, playback), daemon=True)
-    recv_thread.start()
-
-    # Do hole-punching: send some empty packets to peer to open NAT bindings
-    for i in range(6):
-        sock.sendto(b'PING', target)
-
-    print('Streaming audio. Press Ctrl-C to quit.')
-    try:
-        while not stop_event.is_set():
-            await asyncio.sleep(0.2)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        send_q.put(None)
-        if in_stream:
-            in_stream.stop()
-        if out_stream:
-            out_stream.stop()
-        sock.close()
+                # Останавливаем аудио
+                send_q.put(None)
+                if in_stream:
+                    in_stream.stop()
+                if out_stream:
+                    out_stream.stop()
+                sock.close()
 
 
 def parse_args():
