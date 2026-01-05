@@ -8,8 +8,8 @@ import aiohttp
 import numpy as np
 import sounddevice as sd
 
-# Audio settings
-SAMPLE_RATE = 44100
+# Audio settings - изменим на более распространенные значения
+DEFAULT_SAMPLE_RATE = 48000  # Более распространенная частота
 CHANNELS = 1
 DTYPE = 'int16'
 FRAME_SIZE = 1024  # samples per packet
@@ -48,10 +48,45 @@ class PlaybackBuffer:
         except queue.Empty:
             outdata.fill(0)
 
+
+def get_device_sample_rate(device_id, is_input=True):
+    # Получить поддерживаемую частоту дискретизации для устройства
+    try:
+        device_info = sd.query_devices(device_id)
+        
+        # Попробовать получить частоту по умолчанию
+        if 'default_samplerate' in device_info:
+            return int(device_info['default_samplerate'])
+        
+        # Попробовать разные частоты
+        test_rates = [48000, 44100, 32000, 16000, 8000]
+        for rate in test_rates:
+            try:
+                if is_input:
+                    sd.check_input_settings(device=device_id, samplerate=rate)
+                else:
+                    sd.check_output_settings(device=device_id, samplerate=rate)
+                return rate
+            except:
+                continue
+        
+        # Если ничего не работает, вернуть дефолтную
+        return DEFAULT_SAMPLE_RATE
+    except Exception:
+        return DEFAULT_SAMPLE_RATE
+
+
 async def run_client(args, stop_event, chat_recv_cb=None, chat_send_q=None):
-    # log
-    print("INPUT DEVICE:", args.input_device)
-    print("OUTPUT DEVICE:", args.output_device)
+    # Получить частоты для устройств
+    input_sample_rate = get_device_sample_rate(args.input_device, is_input=True)
+    output_sample_rate = get_device_sample_rate(args.output_device, is_input=False)
+    
+    # Использовать минимальную из двух для совместимости
+    sample_rate = min(input_sample_rate, output_sample_rate)
+    
+    print(f"INPUT DEVICE: {args.input_device}, SAMPLE RATE: {input_sample_rate} Hz")
+    print(f"OUTPUT DEVICE: {args.output_device}, SAMPLE RATE: {output_sample_rate} Hz")
+    print(f"USING SAMPLE RATE: {sample_rate} Hz")
 
     # create UDP socket
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -126,7 +161,7 @@ async def run_client(args, stop_event, chat_recv_cb=None, chat_send_q=None):
     # Playback buffer and output stream
     playback = PlaybackBuffer()
     out_stream = sd.OutputStream(
-        samplerate=SAMPLE_RATE,
+        samplerate=sample_rate,  # Используем рассчитанную частоту
         channels=CHANNELS,
         dtype=DTYPE,
         blocksize=FRAME_SIZE,
@@ -136,7 +171,7 @@ async def run_client(args, stop_event, chat_recv_cb=None, chat_send_q=None):
     out_stream.start()
 
     in_stream = sd.InputStream(
-        samplerate=SAMPLE_RATE,
+        samplerate=sample_rate,  # Используем рассчитанную частоту
         channels=CHANNELS,
         dtype=DTYPE,
         blocksize=FRAME_SIZE,
@@ -207,7 +242,7 @@ def start_peer(
     chat_recv_cb=None,
     chat_send_q=None
 ):
-    # Create arguments for the client
+    # Создать аргументы для клиента
     class Args:
         pass
     
@@ -219,18 +254,18 @@ def start_peer(
     args.bind_port = int(bind_port)
     args.input_device = input_device
     args.output_device = output_device
-
-    # Function to run in a separate thread
+    
+    # Функция для запуска в отдельном потоке
     def run_peer():
-        # Create a function for the chat callback
+        # Создать функцию для обратного вызова чата
         def local_chat_recv(sender, text):
             if chat_recv_cb:
                 chat_recv_cb(sender, text)
-
-        # Run the client
+        
+        # Запустить клиент
         asyncio.run(run_client(args, stop_event, chat_recv_cb=local_chat_recv, chat_send_q=chat_send_q))
     
-    # Run in a separate thread
+    # Запустить в отдельном потоке
     peer_thread = threading.Thread(target=run_peer, daemon=True)
     peer_thread.start()
     return peer_thread
