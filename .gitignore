@@ -1,0 +1,38 @@
+# Создайте .gitignore если его нет
+# Или отредактируйте существующий
+
+# Добавьте эти правила:
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+build/
+dist/
+*.egg-info/
+.installed.cfg
+*.egg
+*.spec
+
+# IDEbuild_onefile.py
+.vscode/
+.idea/
+*.swp
+*.swo
+build_onefile.py
+pyinstaller-hook.py
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Windows
+desktop.ini
+
+# PyInstaller
+*.spec
