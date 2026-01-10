@@ -1,402 +1,479 @@
+# gui.py - Только клиентский интерфейс
 import os
 import sys
+import json
 import threading
-import asyncio
-import logging
+import subprocess
 import queue
 import tkinter as tk
 import sounddevice as sd
-from tkinter import scrolledtext, messagebox
-from peer import start_peer
-import threading
-import subprocess
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-SERVER_SCRIPT = os.path.join(SCRIPT_DIR, 'rendezvous_server.py')
-import rendezvous_server
+from tkinter import scrolledtext, messagebox, ttk
+from client import start_peer
 
 
-class ServerGUI(tk.Tk):
+class VoiceChatGUI(tk.Tk):
+    # Главое окно голосового чата с управлением сервером и клиентом
     def __init__(self):
         super().__init__()
-        self.title('Rendezvous Server GUI')
-        self.geometry('700x480')
+        self.title('Голосовой чат P2P')
+        self.geometry('800x700')
+
+        # Файл конфигурации для сохранения настроек
+        self.config_file = 'voice_chat_config.json'
+
+        # Состояние сервера
+        self.server_process = None
+        self.server_log_queue = queue.Queue()
         
-        self.inproc_var = tk.BooleanVar(value=True)
+        # Состояние клиента
+        self.peer_thread = None
+        self.peer_stop_event = None
+        self.chat_send_q = None
 
-        top_frame = tk.Frame(self)
-        top_frame.pack(fill='x', padx=8, pady=6)
+        # Тема (загружаем из конфига при запуске)
+        self.dark_mode = self.load_config()
+        self.colors = self.get_dark_colors() if self.dark_mode else self.get_light_colors()
+        self.configure(bg=self.colors['bg'])
 
-        tk.Label(top_frame, text='Port:').pack(side='left')
-        self.port_var = tk.StringVar(value='8080')
-        tk.Entry(top_frame, textvariable=self.port_var, width=8).pack(side='left', padx=(4, 12))
-
-        # option: run in-process instead of subprocess (enabled by default)
-        tk.Checkbutton(top_frame, text='Run in-process', variable=self.inproc_var).pack(side='left', padx=(6,0))
-
-        self.start_btn = tk.Button(top_frame, text='Start Server', command=self.start_server)
-        self.start_btn.pack(side='left')
-        self.stop_btn = tk.Button(top_frame, text='Stop Server', command=self.stop_server, state='disabled')
-        self.stop_btn.pack(side='left', padx=(6,0))
-
-        self.status_var = tk.StringVar(value='Stopped')
-        tk.Label(top_frame, textvariable=self.status_var).pack(side='right')
-
-        self.log_box = scrolledtext.ScrolledText(self, state='disabled', wrap='word')
-        self.log_box.pack(fill='both', expand=True, padx=8, pady=(0,8))
-
-        self.proc = None
-        self.log_queue = queue.Queue()
-        self.log_thread = None
-
-        # in-process server state
-        self.server_thread = None
-        self.server_loop = None
-        self.server_runner = None
-        self.log_handler = None
-
-        # Client controls frame
-        client_frame = tk.Frame(self)
-        client_frame.pack(fill='x', padx=8, pady=(4,6))
-
-        # Audio devices
+        # Аудио устройства
         try:
-            self.sd_devices = sd.query_devices()
+            devices = sd.query_devices()
+            self.input_devices = {}
+            for i, d in enumerate(devices):
+                if d.get('max_input_channels', 0) > 0:
+                    rate = d.get('default_samplerate', 'N/A')
+                    self.input_devices[f"{d['name']} ({rate} Гц)"] = i
+
+            self.output_devices = {}
+            for i, d in enumerate(devices):
+                if d.get('max_output_channels', 0) > 0:
+                    rate = d.get('default_samplerate', 'N/A')
+                    self.output_devices[f"{d['name']} ({rate} Гц)"] = i
         except Exception as e:
-            self.sd_devices = []
-            messagebox.showerror("Audio error", str(e))
+            messagebox.showerror("Ошибка аудио", str(e))
+            self.input_devices = {}
+            self.output_devices = {}
 
-        # maps: name -> index
-        self.input_dev_map = {}
-        for i, d in enumerate(self.sd_devices):
-            if d.get('max_input_channels', 0) > 0:
-                rate = d.get('default_samplerate', 'N/A')
-                self.input_dev_map[f"{d['name']} ({rate} Hz)"] = i
-        
-        self.output_dev_map = {}
-        for i, d in enumerate(self.sd_devices):
-            if d.get('max_output_channels', 0) > 0:
-                rate = d.get('default_samplerate', 'N/A')
-                self.output_dev_map[f"{d['name']} ({rate} Hz)"] = i
+        # Создание интерфейса
+        self.create_widgets()
 
-        self.client_process = None
+        # Применяем тему
+        self.apply_theme()
 
+        # Запуск обновление логов сервера
+        self.after(100, self.update_server_logs)
 
-        # UI
-        tk.Label(client_frame, text='Server IP:').grid(row=0, column=0, sticky='w')
-        self.client_server_ip_var = tk.StringVar(value='127.0.0.1')
-        tk.Entry(client_frame, textvariable=self.client_server_ip_var, width=16).grid(row=0, column=1, sticky='w', padx=(4,6))
-        tk.Label(client_frame, text='Port:').grid(row=0, column=2, sticky='w')
-        self.client_server_port_var = tk.StringVar(value='8080')
-        tk.Entry(client_frame, textvariable=self.client_server_port_var, width=8).grid(row=0, column=3, sticky='w')
-        tk.Label(client_frame, text='Room:').grid(row=1, column=0, sticky='w')
-        self.client_room_var = tk.StringVar(value='testroom')
-        tk.Entry(client_frame, textvariable=self.client_room_var, width=12).grid(row=1, column=1, sticky='w')
-        tk.Label(client_frame, text='ID:').grid(row=1, column=2, sticky='w')
-        self.client_id_var = tk.StringVar(value='peer1')
-        tk.Entry(client_frame, textvariable=self.client_id_var, width=12).grid(row=1, column=3, sticky='w')
+        # Сохраняем настройки при закрытии окна
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-        # Chat UI
-        tk.Label(self, text="chat").pack(anchor='w', padx=8)
-
-        self.chat_box = scrolledtext.ScrolledText(self, height=6, state='disabled')
-        self.chat_box.pack(fill='x', padx=8)
-
-        chat_frame = tk.Frame(self)
-        chat_frame.pack(fill='x', padx=8, pady=4)
-
-        self.chat_entry = tk.Entry(chat_frame)
-        self.chat_entry.pack(side='left', fill='x', expand=True)
-
-        tk.Button(chat_frame, text='Send', command=self._send_chat).pack(side='left', padx=4)   
-
-        # Mic selection
-        tk.Label(client_frame, text='Mic:').grid(row=2, column=0, sticky='w')
-
-        self.input_dev_var = tk.StringVar(
-            value=next(iter(self.input_dev_map)) if self.input_dev_map else ''
-        )
-
-        tk.OptionMenu(
-            client_frame,
-            self.input_dev_var,
-            *self.input_dev_map.keys()
-        ).grid(row=2, column=1, sticky='w')
-
-        # Speaker selection
-        tk.Label(client_frame, text='Speaker:').grid(row=2, column=2, sticky='w')
-        
-        self.output_dev_var = tk.StringVar(
-            value=next(iter(self.output_dev_map)) if self.output_dev_map else ''
-        )
-        
-        tk.OptionMenu(
-            client_frame,
-            self.output_dev_var,
-            *self.output_dev_map.keys()
-        ).grid(row=2, column=3, sticky='w')
-
-        # Start client button
-        self.start_client_btn = tk.Button(
-            client_frame,
-            text='Start Client',
-            command=self.start_peer_process
-        )
-        self.start_client_btn.grid(row=3, column=3, sticky='e', pady=(6, 0))
-
-        # Stop client button
-        self.stop_client_btn = tk.Button(
-            client_frame,
-            text='Stop Client',
-            command=self.stop_peer_process,
-            state='disabled'
-        )
-        self.stop_client_btn.grid(row=3, column=2, sticky='e', pady=(6, 0))
-
-        # Advanced options (bind IP/port) - hidden by default
-        self.show_advanced_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(client_frame, text='Show advanced', variable=self.show_advanced_var, command=lambda: self._toggle_advanced(adv_frame)).grid(row=0, column=4, padx=(8,0))
-
-        # move bind IP/port into adv_frame so it can be hidden
-        adv_frame = tk.Frame(client_frame)
-        adv_frame.grid(row=2, column=0, columnspan=4, sticky='w')
-        tk.Label(adv_frame, text='Bind IP:').grid(row=0, column=0, sticky='w')
-        self.client_bind_ip_var = tk.StringVar(value='0.0.0.0')
-        tk.Entry(adv_frame, textvariable=self.client_bind_ip_var, width=12).grid(row=0, column=1, sticky='w')
-
-        tk.Label(adv_frame, text='Bind Port:').grid(row=0, column=2, sticky='w')
-        self.client_bind_port_var = tk.StringVar(value='0')
-        tk.Entry(adv_frame, textvariable=self.client_bind_port_var, width=12).grid(row=0, column=3, sticky='w')
-
-        # hide advanced by default
-        adv_frame.grid_remove()
-
-        self.after(200, self._poll_log_queue)
-
-        # Auto-size window to fit content (avoid needing manual stretching)
-        # Use the original geometry as a minimum baseline
+    def load_config(self):
+        """Загрузка конфигурации из файла"""
         try:
-            self.update_idletasks()
-            req_w = self.winfo_reqwidth() + 24
-            req_h = self.winfo_reqheight() + 24
-            base_w, base_h = 700, 480
-            w = max(base_w, req_w)
-            h = max(base_h, req_h)
-            # limit to reasonable maximums to avoid too large windows
-            w = min(w, 1400)
-            h = min(h, 1000)
-            self.geometry(f"{w}x{h}")
-            self.minsize(min(w, 600), min(h, 400))
-        except Exception:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r') as f:
+                    config = json.load(f)
+                    return config.get('dark_mode', False)
+        except Exception as e:
+            print(f"Ошибка загрузки конфигурации: {e}")
+        return False
+
+    def save_config(self):
+        """Сохранение конфигурации в файл"""
+        try:
+            config = {
+                'dark_mode': self.dark_mode
+            }
+            with open(self.config_file, 'w') as f:
+                json.dump(config, f, indent=2)
+        except Exception as e:
+            print(f"Ошибка сохранения конфигурации: {e}")
+
+    def on_closing(self):
+        """Обработка закрытия окна"""
+        # Останавливаем сервер если запущен
+        if self.server_process:
+            self.stop_server()
+
+        # Отключаем клиента если подключен
+        if self.peer_stop_event:
+            self.disconnect_client()
+
+        # Сохраняем конфигурацию
+        self.save_config()
+
+        # Закрываем приложение
+        self.destroy()
+
+    def get_light_colors(self):
+        return {
+            'bg': '#f0f0f0',
+            'fg': '#000000',
+            'text_bg': '#ffffff',
+            'text_fg': '#000000',
+            'entry_bg': '#ffffff',
+            'button_bg': '#e0e0e0',
+            'select_bg': '#d0d0d0',
+            'frame_bg': '#e8e8e8',
+            'label_bg': '#f0f0f0'
+        }
+        
+    def get_dark_colors(self):
+        return{
+            'bg': '#2d2d30',
+            'fg': '#ffffff',
+            'text_bg': '#1e1e1e',
+            'text_fg': '#d4d4d4',
+            'entry_bg': '#3e3e42',
+            'button_bg': '#3e3e42',
+            'select_bg': '#505050',
+            'frame_bg': '#252526',
+            'label_bg': '#2d2d30'
+        }
+    
+    def toggle_theme(self):
+        self.dark_mode = not self.dark_mode
+        self.colors = self.get_dark_colors() if self.dark_mode else self.get_light_colors()
+        self.theme_btn.config(text='☀️ Светлая тема' if self.dark_mode else '🌙 Темная тема')
+        self.apply_theme()
+        self.save_config()
+
+    def apply_theme(self):
+        self.configure(bg=self.colors['bg'])
+    
+        def apply_to_widget(widget):
+            try:
+                widget_type = widget.winfo_class()
+    
+                if widget_type in ('Frame', 'TFrame'):
+                    widget.configure(bg=self.colors['frame_bg'])
+                elif widget_type in ('Text', 'ScrolledText'):
+                    widget.configure(bg=self.colors['text_bg'], fg=self.colors['text_fg'])
+                elif widget_type == 'Entry':
+                    widget.configure(bg=self.colors['entry_bg'], fg=self.colors['fg'])
+                elif widget_type == 'Button':
+                    widget.configure(bg=self.colors['button_bg'], fg=self.colors['fg'])
+                elif widget_type == 'Label':
+                    widget.configure(bg=self.colors['label_bg'], fg=self.colors['fg'])
+                elif widget_type == 'Labelframe':
+                    widget.configure(bg=self.colors['frame_bg'], fg=self.colors['fg'])
+            except:
+                pass
+            
+            for child in widget.winfo_children():
+                apply_to_widget(child)
+    
+        apply_to_widget(self)
+        
+        # Применяем стили для ttk виджетов
+        try:
+            style = ttk.Style()
+            style.theme_use('default')
+            
+            # Конфигурируем стили для ttk
+            style.configure('TNotebook', background=self.colors['frame_bg'])
+            style.configure('TNotebook.Tab', background=self.colors['button_bg'], 
+                          foreground=self.colors['fg'])
+            style.map('TNotebook.Tab', background=[('selected', self.colors['select_bg'])])
+        except:
             pass
+
+    def create_widgets(self):
+        # Создаем Notebook (вкладки)
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill='both', expand=True, padx=5, pady=5)
+
+        # Вкладка Сервер
+        server_tab = tk.Frame(notebook, bg=self.colors['frame_bg'])
+        notebook.add(server_tab, text='📡 Сервер')
+        self.create_server_tab(server_tab)
+
+        # Вкладка Клиент
+        client_tab = tk.Frame(notebook, bg=self.colors['frame_bg'])
+        notebook.add(client_tab, text='🎧 Клиент')
+        self.create_client_tab(client_tab)
+        
+        # Кнопка темы
+        self.theme_btn = tk.Button(self, text='☀️ Светлая тема' if self.dark_mode else '🌙 Темная тема', command=self.toggle_theme, bg=self.colors['button_bg'], fg=self.colors['fg'])
+        self.theme_btn.pack(side='bottom', pady=5)
+    
+    def create_server_tab(self, parent):
+        # Настройки сервера
+        server_frame = tk.LabelFrame(parent, text="Управление сервером", bg=self.colors['frame_bg'], fg=self.colors['fg'])
+        server_frame.pack(fill='x', padx=10, pady=10)
+        
+        # Порт сервера
+        tk.Label(server_frame, text="Порт сервера:", bg=self.colors['frame_bg'], fg=self.colors['fg']).grid(row=0, column=0, sticky='w', padx=5, pady=5)
+        
+        self.server_port_var = tk.StringVar(value='8080')
+        tk.Entry(server_frame, textvariable=self.server_port_var, width=10, bg=self.colors['entry_bg'], fg=self.colors['fg']).grid(row=0, column=1, sticky='w', padx=5, pady=5)
+        
+        # Кнопки управления сервером
+        self.start_server_btn = tk.Button(server_frame, text="▶ Запустить сервер", command=self.start_server, bg=self.colors['button_bg'], fg=self.colors['fg'])
+        self.start_server_btn.grid(row=0, column=2, padx=5, pady=5)
+        
+        self.stop_server_btn = tk.Button(server_frame, text="⏹ Остановить сервер", command=self.stop_server, state='disabled', bg=self.colors['button_bg'], fg=self.colors['fg'])
+        self.stop_server_btn.grid(row=0, column=3, padx=5, pady=5)
+        
+        # Логи сервера
+        log_frame = tk.LabelFrame(parent, text="Логи сервера", bg=self.colors['frame_bg'], fg=self.colors['fg'])
+        log_frame.pack(fill='both', expand=True, padx=10, pady=(0, 10))
+        
+        self.server_log = scrolledtext.ScrolledText(log_frame, height=15, bg=self.colors['text_bg'], fg=self.colors['text_fg'])
+        self.server_log.pack(fill='both', expand=True, padx=5, pady=5)
+        self.server_log.config(state='disabled')
+    
+    def create_client_tab(self, parent):
+        # Основной контейнер клиента
+        main_frame = tk.Frame(parent, bg=self.colors['frame_bg'])
+        main_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        # Настройки подключения
+        conn_frame = tk.LabelFrame(main_frame, text="Настройки подключения", bg=self.colors['frame_bg'], fg=self.colors['fg'])
+        conn_frame.pack(fill='x', pady=(0, 10))
+        
+        # Строка 1: Сервер и порт
+        tk.Label(conn_frame, text="Сервер:", bg=self.colors['frame_bg'], fg=self.colors['fg']).grid(row=0, column=0, sticky='w', padx=5, pady=5)
+        
+        self.server_ip_var = tk.StringVar(value='127.0.0.1')
+        tk.Entry(conn_frame, textvariable=self.server_ip_var, width=15, bg=self.colors['entry_bg'], fg=self.colors['fg']).grid(row=0, column=1, sticky='w', padx=5, pady=5)
+        
+        tk.Label(conn_frame, text="Порт:", bg=self.colors['frame_bg'], fg=self.colors['fg']).grid(row=0, column=2, sticky='w', padx=5, pady=5)
+        
+        self.client_port_var = tk.StringVar(value='8080')
+        tk.Entry(conn_frame, textvariable=self.client_port_var, width=8, bg=self.colors['entry_bg'], fg=self.colors['fg']).grid(row=0, column=3, sticky='w', padx=5, pady=5)
+        
+        # Строка 2: Комната и ID
+        tk.Label(conn_frame, text="Комната:", bg=self.colors['frame_bg'], fg=self.colors['fg']).grid(row=1, column=0, sticky='w', padx=5, pady=5)
+        
+        self.room_var = tk.StringVar(value='chatroom')
+        tk.Entry(conn_frame, textvariable=self.room_var, width=15, bg=self.colors['entry_bg'], fg=self.colors['fg']).grid(row=1, column=1, sticky='w', padx=5, pady=5)
+        
+        tk.Label(conn_frame, text="Ваш ID:", bg=self.colors['frame_bg'], fg=self.colors['fg']).grid(row=1, column=2, sticky='w', padx=5, pady=5)
+        
+        self.id_var = tk.StringVar(value='user1')
+        tk.Entry(conn_frame, textvariable=self.id_var, width=8, bg=self.colors['entry_bg'], fg=self.colors['fg']).grid(row=1, column=3, sticky='w', padx=5, pady=5)
+        
+        # Аудио устройства
+        audio_frame = tk.LabelFrame(main_frame, text="Аудио устройства", bg=self.colors['frame_bg'], fg=self.colors['fg'])
+        audio_frame.pack(fill='x', pady=(0, 10))
+        
+        # Микрофон
+        tk.Label(audio_frame, text="Микрофон:", bg=self.colors['frame_bg'], fg=self.colors['fg']).grid(row=0, column=0, sticky='w', padx=5, pady=5)
+
+        if self.input_devices:
+            self.input_var = tk.StringVar(value=list(self.input_devices.keys())[0])
+            input_menu = tk.OptionMenu(audio_frame, self.input_var, *self.input_devices.keys())
+            input_menu.grid(row=0, column=1, sticky='w', padx=5, pady=5)
+            input_menu.configure(bg=self.colors['button_bg'], fg=self.colors['fg'])
+        else:
+            self.input_var = tk.StringVar(value='Нет устройств')
+            tk.Label(audio_frame, text="Нет микрофонов", bg=self.colors['frame_bg'], fg=self.colors['fg']).grid(row=0, column=1, sticky='w', padx=5, pady=5)
+
+        # Динамики
+        tk.Label(audio_frame, text="Динамики:", bg=self.colors['frame_bg'], fg=self.colors['fg']).grid(row=0, column=2, sticky='w', padx=5, pady=5)
+
+        if self.output_devices:
+            self.output_var = tk.StringVar(value=list(self.output_devices.keys())[0])
+            output_menu = tk.OptionMenu(audio_frame, self.output_var, *self.output_devices.keys())
+            output_menu.grid(row=0, column=3, sticky='w', padx=5, pady=5)
+            output_menu.configure(bg=self.colors['button_bg'], fg=self.colors['fg'])
+        else:
+            self.output_var = tk.StringVar(value='Нет устройств')
+            tk.Label(audio_frame, text="Нет динамиков", bg=self.colors['frame_bg'], fg=self.colors['fg']).grid(row=0, column=3, sticky='w', padx=5, pady=5)
+        
+        # Кнопки управления клиентом
+        btn_frame = tk.Frame(main_frame, bg=self.colors['frame_bg'])
+        btn_frame.pack(fill='x', pady=(0, 10))
+        
+        self.connect_btn = tk.Button(btn_frame, text="▶ Подключиться", command=self.connect_client, bg=self.colors['button_bg'], fg=self.colors['fg'])
+        self.connect_btn.pack(side='left', padx=5)
+        
+        self.disconnect_btn = tk.Button(btn_frame, text="⏹ Отключиться", command=self.disconnect_client, state='disabled', bg=self.colors['button_bg'], fg=self.colors['fg'])
+        self.disconnect_btn.pack(side='left', padx=5)
+        
+        # Чат
+        chat_frame = tk.LabelFrame(main_frame, text="Чат", bg=self.colors['frame_bg'], fg=self.colors['fg'])
+        chat_frame.pack(fill='both', expand=True, pady=(0, 10))
+        
+        self.chat_text = scrolledtext.ScrolledText(chat_frame, height=10, bg=self.colors['text_bg'], fg=self.colors['text_fg'])
+        self.chat_text.pack(fill='both', expand=True, padx=5, pady=5)
+        self.chat_text.config(state='disabled')
+        
+        # Ввод сообщения
+        input_frame = tk.Frame(chat_frame, bg=self.colors['frame_bg'])
+        input_frame.pack(fill='x', padx=5, pady=(0, 5))
+        
+        self.message_var = tk.StringVar()
+        self.message_entry = tk.Entry(input_frame, textvariable=self.message_var, bg=self.colors['entry_bg'], fg=self.colors['fg'])
+        self.message_entry.pack(side='left', fill='x', expand=True, padx=(0, 5))
+        self.message_entry.bind('<Return>', lambda e: self.send_message())
+        
+        self.send_btn = tk.Button(input_frame, text="Отправить", command=self.send_message, bg=self.colors['button_bg'], fg=self.colors['fg'])
+        self.send_btn.pack(side='right')
+        
+        # Статус клиента
+        self.client_status_var = tk.StringVar(value="Готов к подключению")
+        tk.Label(main_frame, textvariable=self.client_status_var, bg=self.colors['frame_bg'], fg=self.colors['fg']).pack()
 
     def start_server(self):
-        if self.proc or self.server_thread:
-            messagebox.showinfo('Info', 'Server already running')
+        """Запуск сервера"""
+        if self.server_process:
+            messagebox.showinfo("Информация", "Сервер уже запущен")
             return
+    
         try:
-            port = int(self.port_var.get())
+            port = int(self.server_port_var.get())
         except ValueError:
-            messagebox.showerror('Error', 'Port must be an integer')
+            messagebox.showerror("Ошибка", "Порт должен быть числом")
             return
-        if self.inproc_var.get():
-            # start in-process server in background thread with its own event loop
-            self.server_thread = threading.Thread(target=self._server_thread, args=(port,), daemon=True)
-            self.server_thread.start()
-            self.status_var.set(f'Running (in-process) on port {port}')
-            self.start_btn.config(state='disabled')
-            self.stop_btn.config(state='normal')
-            self._append_log(f'Started in-process server on port {port}\n')
-        else:
-            cmd = [sys.executable, SERVER_SCRIPT, '--port', str(port)]
-            # start subprocess and capture stdout/stderr
-            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=SCRIPT_DIR)
-            self.status_var.set(f'Running on port {port}')
-            self.start_btn.config(state='disabled')
-            self.stop_btn.config(state='normal')
+        
+        # Запускаем сервер как подпроцесс
+        cmd = [sys.executable, 'server.py', '--port', str(port)]
+        self.server_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True
+        )
 
-            # start reader thread
-            self.log_thread = threading.Thread(target=self._reader_thread, daemon=True)
-            self.log_thread.start()
-            self._append_log(f'Launched server: {" ".join(cmd)}\n')
+        # Запускаем поток для чтение вывода сервера
+        threading.Thread(target=self.read_server_output, daemon=True).start()
+
+        self.start_server_btn.config(state='disabled')
+        self.stop_server_btn.config(state='normal')
+        self.append_server_log(f"Сервер запущен на порту {port}\n")
 
     def stop_server(self):
-        # stop subprocess server
-        if self.proc:
+        """Остановка сервера"""
+        if self.server_process:
+            self.server_process.terminate()
             try:
-                self.proc.terminate()
-            except Exception:
-                pass
-            self.proc = None
-            self.status_var.set('Stopped')
-            self.start_btn.config(state='normal')
-            self.stop_btn.config(state='disabled')
-            self._append_log('Server stopped (subprocess)\n')
-            return
+                self.server_process.wait(timeout=5)
+            except:
+                self.server_process.kill()
 
-        # stop in-process server
-        if self.server_thread and self.server_loop:
-            try:
-                # schedule cleanup
-                fut = asyncio.run_coroutine_threadsafe(rendezvous_server.stop_server_runner(self.server_runner), self.server_loop)
-                fut.result(timeout=5)
-            except Exception:
-                pass
-            try:
-                self.server_loop.call_soon_threadsafe(self.server_loop.stop)
-            except Exception:
-                pass
-            # wait for thread to finish
-            self.server_thread.join(timeout=2)
-            self.server_thread = None
-            self.server_loop = None
-            self.server_runner = None
-            # remove logging handler if added
-            if self.log_handler:
-                logging.getLogger().removeHandler(self.log_handler)
-                self.log_handler = None
-            self.status_var.set('Stopped')
-            self.start_btn.config(state='normal')
-            self.stop_btn.config(state='disabled')
-            self._append_log('Server stopped (in-process)\n')
-            return
+            self.server_process = None
+            self.append_server_log("Сервер остановлен\n")
 
-    def _reader_thread(self):
-        proc = self.proc
+        self.start_server_btn.config(state='normal')
+        self.stop_server_btn.config(state='disabled')
+
+    def read_server_output(self):
+        """Чтение вывода сервера"""
         try:
-            for line in proc.stdout:
-                self.log_queue.put(line)
-        except Exception:
+            while self.server_process and self.server_process.poll() is None:
+                line = self.server_process.stdout.readline()
+                if line:
+                    self.server_log_queue.put(line)
+                else:
+                    break
+        except:
             pass
 
-    def _server_thread(self, port: int):
-        # runs in background thread
-        loop = asyncio.new_event_loop()
-        self.server_loop = loop
-        asyncio.set_event_loop(loop)
-        try:
-            runner = loop.run_until_complete(rendezvous_server.create_server_runner(port))
-            self.server_runner = runner
-            # add logging handler to forward logs to GUI
-            class QueueHandler(logging.Handler):
-                def __init__(self, q):
-                    super().__init__()
-                    self.q = q
-                def emit(self, record):
-                    try:
-                        msg = self.format(record)
-                        self.q.put(msg + "\n")
-                    except Exception:
-                        pass
-
-            h = QueueHandler(self.log_queue)
-            h.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
-            logging.getLogger().addHandler(h)
-            self.log_handler = h
-
-            # run loop until stopped
-            loop.run_forever()
-        finally:
-            try:
-                loop.run_until_complete(runner.cleanup())
-            except Exception:
-                pass
-            try:
-                logging.getLogger().removeHandler(self.log_handler)
-            except Exception:
-                pass
-            loop.close()
-
-    def _toggle_advanced(self, adv_frame):
-        try:
-            if self.show_advanced_var.get():
-                adv_frame.grid()
-            else:
-                adv_frame.grid_remove()
-        except Exception:
-            pass
-    
-    def start_peer_process(self):
-        self.peer_stop_event = threading.Event()
-        self.chat_send_q = queue.Queue()
-    
-        server_ip = self.client_server_ip_var.get().strip()
-        server_port = self.client_server_port_var.get().strip()
-    
-        self.peer_thread = threading.Thread(
-            target=start_peer,
-            daemon=True,
-            args=(
-                f"ws://{server_ip}:{server_port}/ws",
-                self.client_room_var.get(),
-                self.client_id_var.get(),
-                self.client_bind_ip_var.get(),
-                self.client_bind_port_var.get(),
-                self.input_dev_map.get(self.input_dev_var.get()),
-                self.output_dev_map.get(self.output_dev_var.get()),
-                self.peer_stop_event,
-                self.on_chat_recv,
-                self.chat_send_q
-            )
-        )
-        self.peer_thread.start()
-    
-        self.start_client_btn.config(state='disabled')
-        self.stop_client_btn.config(state='normal')
-
-
-    
-    def stop_peer_process(self):
-        if self.peer_stop_event:
-            self.peer_stop_event.set()
-    
-        self.start_client_btn.config(state='normal')
-        self.stop_client_btn.config(state='disabled')
-    
-
-    def _poll_log_queue(self):
+    def update_server_logs(self):
+        """Обновление логов сервера в интерфейсе"""
         try:
             while True:
-                line = self.log_queue.get_nowait()
-                self._append_log(line)
+                line = self.server_log_queue.get_nowait()
+                self.append_server_log(line)
         except queue.Empty:
             pass
-        # if process finished, update state
-        if self.proc and self.proc.poll() is not None:
-            self._append_log(f'Process exited with code {self.proc.returncode}\n')
-            self.proc = None
-            self.status_var.set('Stopped')
-            self.start_btn.config(state='normal')
-            self.stop_btn.config(state='disabled')
-        self.after(200, self._poll_log_queue)
 
-    def _append_log(self, text):
-        self.log_box.config(state='normal')
-        self.log_box.insert('end', text)
-        self.log_box.see('end')
-        self.log_box.config(state='disabled')
+        # Проверяем статус процесса
+        if self.server_process and self.server_process.poll() is not None:
+            self.append_server_log(f"Сервер завершил работу (код: {self.server_process.returncode})\n")
+            self.server_process = None
+            self.start_server_btn.config(state='normal')
+            self.stop_server_btn.config(state='disabled')
 
-    # Отправка сообщение
-    def _send_chat(self):
-        msg = self.chat_entry.get().strip()
-        print(f"Sending chat: {msg}")
-        if not msg:
+        self.after(100, self.update_server_logs)
+
+    def append_server_log(self, text):
+        """Добавление текста в лог сервера"""
+        self.server_log.config(state='normal')
+        self.server_log.insert('end', text)
+        self.server_log.see('end')
+        self.server_log.config(state='disabled')
+
+    def connect_client(self):
+        """Подключение клиента"""
+        if self.peer_thread and self.peer_thread.is_alive():
+            messagebox.showinfo("Информация", "Клиент уже подключен")
             return
-        self.chat_entry.delete(0, 'end')
-        self.chat_send_q.put(msg)
-        self.append_chat(f"[me]: {msg}\n")
+        
+        # Проверка устройств
+        input_device = self.input_devices.get(self.input_var.get())
+        output_device = self.output_devices.get(self.output_var.get())
 
-    def on_chat_recv(self, sender, text):
-        print("GUI CHAT:", sender, text)
+        if input_device is None or output_device is None:
+            messagebox.showerror("Ошибка", "Выберите аудио устройства")
+            return
+        
+        # Создаем очередь и событие остановки
+        self.peer_stop_event = threading.Event()
+        self.chat_send_q = queue.Queue()
+
+        # Запуск клиента в отдельном потоке
+        try:
+            self.peer_thread = start_peer(
+                server_url=f"ws://{self.server_ip_var.get()}:{self.client_port_var.get()}/ws",
+                room=self.room_var.get(),
+                peer_id=self.id_var.get(),
+                bind_ip='0.0.0.0',
+                bind_port=0,
+                input_device=input_device,
+                output_device=output_device,
+                stop_event=self.peer_stop_event,
+                chat_recv_cb=self.on_chat_message,
+                chat_send_q=self.chat_send_q
+            )
+
+            # Обновление интерфейса
+            self.connect_btn.config(state='disabled')
+            self.disconnect_btn.config(state='normal')
+            self.client_status_var.set("Подключено. Ожидание собеседника...")
+            self.append_chat("Система: Подключение установлено\n")
+
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось подключиться: {str(e)}")
+
+    def disconnect_client(self):
+        """Отключение клиента"""
+        if self.peer_stop_event:
+            self.peer_stop_event.set()
+        
+        self.connect_btn.config(state='normal')
+        self.disconnect_btn.config(state='disabled')
+        self.client_status_var.set("Отключено")
+        self.append_chat("Система: Отключено\n")
+    
+    def send_message(self):
+        """Отправка сообщения"""
+        message = self.message_var.get().strip()
+        if not message:
+            return
+        
+        if self.chat_send_q:
+            self.chat_send_q.put(message)
+            self.append_chat(f"Вы: {message}\n")
+            self.message_var.set("")
+        else:
+            messagebox.showwarning("Предупреждение", "Сначала подключитесь")
+
+
+    def on_chat_message(self, sender, text):
+        """Обработка новых сообщений"""
         self.append_chat(f"{sender}: {text}\n")
 
-        
     def append_chat(self, text):
-        self.chat_box.config(state='normal')
-        self.chat_box.insert('end', text)
-        self.chat_box.see('end')
-        self.chat_box.config(state='disabled')
+        """Добавление текста в чат"""
+        self.chat_text.config(state='normal')
+        self.chat_text.insert('end', text)
+        self.chat_text.see('end')
+        self.chat_text.config(state='disabled')
 
 if __name__ == '__main__':
-    app = ServerGUI()
+    app = VoiceChatGUI()
     app.mainloop()

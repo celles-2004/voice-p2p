@@ -94,7 +94,7 @@ async def run_client(args, stop_event, chat_recv_cb=None, chat_send_q=None):
     local_port = sock.getsockname()[1]
     
     # Ожидание и регистрация пиров.
-    print('Ожидание пиров)')
+    print('Ожидание пиров...)')
 
     peers = []
 
