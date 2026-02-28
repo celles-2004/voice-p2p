@@ -265,21 +265,26 @@ class VoiceChatGUI(tk.Tk):
             input_menu = tk.OptionMenu(audio_frame, self.input_var, *self.input_devices.keys())
             input_menu.grid(row=0, column=1, sticky='w', padx=5, pady=5)
             input_menu.configure(bg=self.colors['button_bg'], fg=self.colors['fg'])
+            self.mic_indicator = tk.Canvas(audio_frame, width=20, height=20, bg='#00ff00', highlightthickness=0)
+            self.mic_indicator.grid(row=0, column=2, padx=(0, 10))
         else:
             self.input_var = tk.StringVar(value='Нет устройств')
             tk.Label(audio_frame, text="Нет микрофонов", bg=self.colors['frame_bg'], fg=self.colors['fg']).grid(row=0, column=1, sticky='w', padx=5, pady=5)
 
         # Динамики
-        tk.Label(audio_frame, text="Динамики:", bg=self.colors['frame_bg'], fg=self.colors['fg']).grid(row=0, column=2, sticky='w', padx=5, pady=5)
+        tk.Label(audio_frame, text="Динамики:", bg=self.colors['frame_bg'], fg=self.colors['fg']).grid(row=0, column=3, sticky='w', padx=5, pady=5)
 
         if self.output_devices:
             self.output_var = tk.StringVar(value=list(self.output_devices.keys())[0])
             output_menu = tk.OptionMenu(audio_frame, self.output_var, *self.output_devices.keys())
-            output_menu.grid(row=0, column=3, sticky='w', padx=5, pady=5)
+            output_menu.grid(row=0, column=4, sticky='w', padx=5, pady=5)
             output_menu.configure(bg=self.colors['button_bg'], fg=self.colors['fg'])
+            self.speaker_indicator = tk.Canvas(audio_frame, width=20, height=20, bg='#00ff00', highlightthickness=0)
+            self.speaker_indicator.grid(row=0, column=5, padx=(0, 10))
+
         else:
             self.output_var = tk.StringVar(value='Нет устройств')
-            tk.Label(audio_frame, text="Нет динамиков", bg=self.colors['frame_bg'], fg=self.colors['fg']).grid(row=0, column=3, sticky='w', padx=5, pady=5)
+            tk.Label(audio_frame, text="Нет динамиков", bg=self.colors['frame_bg'], fg=self.colors['fg']).grid(row=0, column=4, sticky='w', padx=5, pady=5)
         
         # Кнопки управления клиентом
         btn_frame = tk.Frame(main_frame, bg=self.colors['frame_bg'])
@@ -314,6 +319,8 @@ class VoiceChatGUI(tk.Tk):
         # Статус клиента
         self.client_status_var = tk.StringVar(value="Готов к подключению")
         tk.Label(main_frame, textvariable=self.client_status_var, bg=self.colors['frame_bg'], fg=self.colors['fg']).pack()
+
+        
 
     def start_server(self):
         """Запуск сервера"""
@@ -427,7 +434,9 @@ class VoiceChatGUI(tk.Tk):
                 output_device=output_device,
                 stop_event=self.peer_stop_event,
                 chat_recv_cb=self.on_chat_message,
-                chat_send_q=self.chat_send_q
+                chat_send_q=self.chat_send_q,
+                mic_rms_cb=self.on_mic_rms,
+                speaker_rms_cb=self.on_speaker_rms
             )
 
             # Обновление интерфейса
@@ -444,6 +453,10 @@ class VoiceChatGUI(tk.Tk):
         if self.peer_stop_event:
             self.peer_stop_event.set()
         
+        if hasattr(self, 'mic_indicator'):
+            self.mic_indicator.config(bg='#00ff00')
+        if hasattr(self, 'speaker_indicator'):
+            self.speaker_indicator.config(bg='#00ff00')
         self.connect_btn.config(state='normal')
         self.disconnect_btn.config(state='disabled')
         self.client_status_var.set("Отключено")
@@ -473,6 +486,33 @@ class VoiceChatGUI(tk.Tk):
         self.chat_text.insert('end', text)
         self.chat_text.see('end')
         self.chat_text.config(state='disabled')
+
+    def on_mic_rms(self, level):
+        """Вызывается из клиента при изменении уровня микрофона"""
+        self.after(0, lambda: self.update_mic_indicator(level))
+
+    def on_speaker_rms(self, level):
+        """Вызывается из клиента при изменении уровня динамиков"""
+        self.after(0, lambda: self.update_speaker_indicator(level))
+
+    def update_mic_indicator(self, level):
+        """Обновляет цвет индикатора микрофона"""
+        color = self.get_level_color(level)
+        self.mic_indicator.config(bg=color)
+
+    def update_speaker_indicator(self, level):
+        """Обновляет цвет индикатора динамиков"""
+        color = self.get_level_color(level)
+        self.speaker_indicator.config(bg=color)
+
+    def get_level_color(self, level):
+        """Возвращает цвет в зависимости от уровня (0-100)"""
+        if level < 10:
+            return '#00ff00'  # зелёный
+        elif level < 50:
+            return '#ffff00'  # жёлтый
+        else:
+            return '#ff0000'  # красный
 
 if __name__ == '__main__':
     app = VoiceChatGUI()

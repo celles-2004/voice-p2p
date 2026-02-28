@@ -26,18 +26,33 @@ def udp_sender_loop(sock: socket.socket, target, send_q: queue.Queue):
             pass
 
 
-def audio_input_callback(indata, frames, time, status, send_q: queue.Queue):
+def audio_input_callback(indata, frames, time, status, send_q: queue.Queue, mic_rms_cb=None):
+    # indata - numpy array int16
+    if mic_rms_cb is not None:
+        # Вычисляем RMS (среднеквадратичное) и нормализуем
+        rms = np.sqrt(np.mean(indata.astype(np.float32)**2))
+        max_val = 32768.0  # максимальное значение int16
+        level = min(100, int((rms / max_val) * 100))
+        mic_rms_cb(level)
     send_q.put(indata.tobytes())
 
 
 class PlaybackBuffer:
-    def __init__(self):
+    def __init__(self, speaker_rms_cb=None):
         self.q = queue.Queue()
+        self.speaker_rms_cb = speaker_rms_cb
 
     def write(self, outdata):
         try:
             data = self.q.get_nowait()
             arr = np.frombuffer(data, dtype=DTYPE).reshape(-1, CHANNELS)
+
+            # Вычисляем RMS для полученного аудио
+            if self.speaker_rms_cb is not None:
+                rms = np.sqrt(np.mean(arr.astype(np.float32)**2))
+                max_val = 32768.0
+                level = min(100, int((rms / max_val) * 100))
+                self.speaker_rms_cb(level)
 
             if arr.size < outdata.size:
                 outdata[:arr.size] = arr
@@ -45,6 +60,8 @@ class PlaybackBuffer:
             else:
                 outdata[:] = arr[:outdata.size]
         except queue.Empty:
+            if self.speaker_rms_cb is not None:
+                self.speaker_rms_cb(0) # нет данных - уровень 0
             outdata.fill(0)
 
 
@@ -58,7 +75,7 @@ def get_device_sample_rate(device_id, is_input=True):
         return DEFAULT_SAMPLE_RATE
 
 
-async def run_client(args, stop_event, chat_recv_cb=None, chat_send_q=None):
+async def run_client(args, stop_event, chat_recv_cb=None, chat_send_q=None, mic_rms_cb=None, speaker_rms_cb=None):
     input_sample_rate = get_device_sample_rate(args.input_device, is_input=True)
     output_sample_rate = get_device_sample_rate(args.output_device, is_input=False)
     sample_rate = min(input_sample_rate, output_sample_rate)
@@ -139,7 +156,7 @@ async def run_client(args, stop_event, chat_recv_cb=None, chat_send_q=None):
             sender_thread = threading.Thread(target=udp_sender_loop, args=(sock, target, send_q), daemon=True)
             sender_thread.start()
 
-            playback = PlaybackBuffer()
+            playback = PlaybackBuffer(speaker_rms_cb)
             out_stream = sd.OutputStream(
                 samplerate=sample_rate,
                 channels=CHANNELS,
@@ -157,7 +174,7 @@ async def run_client(args, stop_event, chat_recv_cb=None, chat_send_q=None):
                 blocksize=FRAME_SIZE,
                 device=args.input_device,
                 callback=lambda indata, frames, time, status:
-                    audio_input_callback(indata.copy(), frames, time, status, send_q)
+                    audio_input_callback(indata.copy(), frames, time, status, send_q, mic_rms_cb)
             )
             in_stream.start()
 
@@ -225,7 +242,10 @@ def start_peer(
     output_device,
     stop_event,
     chat_recv_cb=None,
-    chat_send_q=None
+    chat_send_q=None,
+    mic_rms_cb=None,
+    speaker_rms_cb=None
+
 ):
     class Args:
         pass
@@ -242,7 +262,7 @@ def start_peer(
         def local_chat_recv(sender, text):
             if chat_recv_cb:
                 chat_recv_cb(sender, text)
-        asyncio.run(run_client(args, stop_event, chat_recv_cb=local_chat_recv, chat_send_q=chat_send_q))
+        asyncio.run(run_client(args, stop_event, chat_recv_cb=local_chat_recv, chat_send_q=chat_send_q, mic_rms_cb=mic_rms_cb, speaker_rms_cb=speaker_rms_cb))
 
     peer_thread = threading.Thread(target=run_peer, daemon=True)
     peer_thread.start()
