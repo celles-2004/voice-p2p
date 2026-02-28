@@ -1,3 +1,4 @@
 aiohttp>=3.8
 sounddevice>=0.4
 numpy>=1.20
+opuslib>=3.0.0
