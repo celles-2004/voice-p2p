@@ -16,7 +16,7 @@ if '--server' in sys.argv:
     # Импортируем server и запускаем его main с нужными аргументами
     import server
     # Извлекаем порт, если он указан
-    port = 8080
+    port = 17789
     try:
         idx = sys.argv.index('--port')
         if idx + 1 < len(sys.argv):
@@ -221,7 +221,7 @@ class VoiceChatGUI(tk.Tk):
         # Порт сервера
         tk.Label(server_frame, text="Порт сервера:", bg=self.colors['frame_bg'], fg=self.colors['fg']).grid(row=0, column=0, sticky='w', padx=5, pady=5)
         
-        self.server_port_var = tk.StringVar(value='8080')
+        self.server_port_var = tk.StringVar(value='17789')
         tk.Entry(server_frame, textvariable=self.server_port_var, width=10, bg=self.colors['entry_bg'], fg=self.colors['fg']).grid(row=0, column=1, sticky='w', padx=5, pady=5)
         
         # Кнопки управления сервером
@@ -256,7 +256,7 @@ class VoiceChatGUI(tk.Tk):
         
         tk.Label(conn_frame, text="Порт:", bg=self.colors['frame_bg'], fg=self.colors['fg']).grid(row=0, column=2, sticky='w', padx=5, pady=5)
         
-        self.client_port_var = tk.StringVar(value='8080')
+        self.client_port_var = tk.StringVar(value='17789')
         tk.Entry(conn_frame, textvariable=self.client_port_var, width=8, bg=self.colors['entry_bg'], fg=self.colors['fg']).grid(row=0, column=3, sticky='w', padx=5, pady=5)
         
         # Строка 2: Комната и ID
@@ -344,13 +344,13 @@ class VoiceChatGUI(tk.Tk):
         if self.server_process:
             messagebox.showinfo("Информация", "Сервер уже запущен")
             return
-    
+
         try:
             port = int(self.server_port_var.get())
         except ValueError:
             messagebox.showerror("Ошибка", "Порт должен быть числом")
             return
-    
+
         # Определяем путь к текущему исполняемому файлу
         if getattr(sys, 'frozen', False):
             # В режиме EXE – сам exe
@@ -364,17 +364,17 @@ class VoiceChatGUI(tk.Tk):
             # Упростим: в разработке тоже будем использовать тот же подход
             # (т.е. запускать python gui.py --server ...)
             # Тогда наш код выше с проверкой --server сработает.
-    
+
         cmd = [exe_path, '--server', '--port', str(port)]
         if not getattr(sys, 'frozen', False):
             # В режиме разработки нужно явно указать gui.py
             cmd = [sys.executable, 'gui.py', '--server', '--port', str(port)]
-    
+
         # Запускаем сервер как подпроцесс, скрывая окно (Windows)
         creationflags = 0
         if sys.platform == 'win32':
             creationflags = subprocess.CREATE_NO_WINDOW  # или DETACHED_PROCESS
-    
+
         self.server_process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -384,14 +384,14 @@ class VoiceChatGUI(tk.Tk):
             universal_newlines=True,
             creationflags=creationflags
         )
-    
+
         # Запускаем поток для чтения вывода сервера
         threading.Thread(target=self.read_server_output, daemon=True).start()
-    
+
         self.start_server_btn.config(state='disabled')
         self.stop_server_btn.config(state='normal')
         self.append_server_log(f"Сервер запущен на порту {port}\n")
-    
+
 
     def stop_server(self):
         """Остановка сервера"""

@@ -107,7 +107,7 @@ async def stop_server_runner(runner: web.AppRunner):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--port', type=int, default=8080, help='Port to listen on')
+    p.add_argument('--port', type=int, default=17789, help='Port to listen on')
     args = p.parse_args()
 
     app = web.Application()

@@ -5,6 +5,7 @@ import socket
 import threading
 import queue
 import aiohttp
+import time
 import numpy as np
 import sounddevice as sd
 
@@ -16,14 +17,18 @@ FRAME_SIZE = 1024  # samples per packet
 
 
 def udp_sender_loop(sock: socket.socket, target, send_q: queue.Queue):
+    packet_count = 0
     while True:
         data = send_q.get()
         if data is None:
             break
         try:
             sock.sendto(data, target)
-        except Exception:
-            pass
+            packet_count += 1
+            if packet_count % 100 == 0:
+                print(f"Отправлено {packet_count} аудио пакетов к {target}")
+        except Exception as e:
+            print(f"Ошибка отправки: {e}")
 
 
 def audio_input_callback(indata, frames, time, status, send_q: queue.Queue, mic_rms_cb=None):
@@ -41,11 +46,21 @@ class PlaybackBuffer:
     def __init__(self, speaker_rms_cb=None):
         self.q = queue.Queue()
         self.speaker_rms_cb = speaker_rms_cb
+        self.received = False
 
     def write(self, outdata):
         try:
             data = self.q.get_nowait()
+            # Проверяем, что данные кратны размеру int16
+            if len(data) % 2 != 0:
+                # Если не кратно – пропускаем (возможно, испорченный пакет)
+                outdata.fill(0)
+                return
             arr = np.frombuffer(data, dtype=DTYPE).reshape(-1, CHANNELS)
+
+            if not self.received:
+                print("Первый аудио пакет **получен**!")  # было "отправлен"
+                self.received = True
 
             # Вычисляем RMS для полученного аудио
             if self.speaker_rms_cb is not None:
@@ -74,6 +89,16 @@ def get_device_sample_rate(device_id, is_input=True):
     except Exception:
         return DEFAULT_SAMPLE_RATE
 
+def udp_keepalive_loop(sock, target, stop_event):
+    while not stop_event.is_set():
+        try:
+            sock.sendto(b'KEEPALIVE', target)
+        except:
+            pass
+        for _ in range(20):  # ждём 2 секунды с проверкой остановки
+            if stop_event.is_set():
+                break
+            time.sleep(0.1)
 
 async def run_client(args, stop_event, chat_recv_cb=None, chat_send_q=None, mic_rms_cb=None, speaker_rms_cb=None):
     input_sample_rate = get_device_sample_rate(args.input_device, is_input=True)
@@ -156,6 +181,10 @@ async def run_client(args, stop_event, chat_recv_cb=None, chat_send_q=None, mic_
             sender_thread = threading.Thread(target=udp_sender_loop, args=(sock, target, send_q), daemon=True)
             sender_thread.start()
 
+            keepalive_stop = threading.Event()
+            keepalive_thread = threading.Thread(target=udp_keepalive_loop, args=(sock, target, keepalive_stop), daemon=True)
+            keepalive_thread.start()
+
             playback = PlaybackBuffer(speaker_rms_cb)
             out_stream = sd.OutputStream(
                 samplerate=sample_rate,
@@ -179,18 +208,23 @@ async def run_client(args, stop_event, chat_recv_cb=None, chat_send_q=None, mic_
             in_stream.start()
 
             def udp_recv_loop(s, playback_buf):
+                expected_size = FRAME_SIZE * 2  # 1024 * 2 = 2048 байт для PCM int16
                 while True:
                     try:
                         data, addr = s.recvfrom(65536)
-                        playback_buf.q.put(data)
+                        # Игнорируем служебные пакеты (PING, KEEPALIVE и т.п.)
+                        if len(data) == expected_size:
+                            playback_buf.q.put(data)
                     except Exception:
                         break
 
             recv_thread = threading.Thread(target=udp_recv_loop, args=(sock, playback), daemon=True)
             recv_thread.start()
 
-            for i in range(6):
+            print("Hole punching: sending initial packets...")
+            for i in range(20):
                 sock.sendto(b'PING', target)
+                time.sleep(0.05)
 
             print('Streaming audio. Press Ctrl-C to quit.')
 
@@ -200,6 +234,8 @@ async def run_client(args, stop_event, chat_recv_cb=None, chat_send_q=None, mic_
             except KeyboardInterrupt:
                 pass
             finally:
+                keepalive_stop.set()
+                keepalive_thread.join(timeout=1)
                 message_handler_task.cancel()
                 chat_send_q.put(None)
                 try:
@@ -216,7 +252,7 @@ async def run_client(args, stop_event, chat_recv_cb=None, chat_send_q=None, mic_
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--server', default='ws://localhost:8080/ws', help='Rendezvous server ws URL')
+    p.add_argument('--server', default='ws://localhost:17789/ws', help='Rendezvous server ws URL')
     p.add_argument('--room', required=True, help='Room name')
     p.add_argument('--id', required=True, help='Peer id')
     p.add_argument('--bind-ip', default='0.0.0.0', help='Local UDP bind IP')
