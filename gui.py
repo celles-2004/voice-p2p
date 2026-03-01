@@ -5,11 +5,28 @@ import json
 import threading
 import subprocess
 import queue
+import argparse
 import tkinter as tk
 import sounddevice as sd
 from tkinter import scrolledtext, messagebox, ttk
 from client import start_peer
 
+# Если скрипт запущен с аргументом --server, запускаем сервер и выходим
+if '--server' in sys.argv:
+    # Импортируем server и запускаем его main с нужными аргументами
+    import server
+    # Извлекаем порт, если он указан
+    port = 8080
+    try:
+        idx = sys.argv.index('--port')
+        if idx + 1 < len(sys.argv):
+            port = int(sys.argv[idx + 1])
+    except (ValueError, IndexError):
+        pass
+    # Подменяем sys.argv для server.main()
+    sys.argv = ['server.py', '--port', str(port)]
+    server.main()
+    sys.exit(0)
 
 class VoiceChatGUI(tk.Tk):
     # Главое окно голосового чата с управлением сервером и клиентом
@@ -333,24 +350,48 @@ class VoiceChatGUI(tk.Tk):
         except ValueError:
             messagebox.showerror("Ошибка", "Порт должен быть числом")
             return
-        
-        # Запускаем сервер как подпроцесс
-        cmd = [sys.executable, 'server.py', '--port', str(port)]
+    
+        # Определяем путь к текущему исполняемому файлу
+        if getattr(sys, 'frozen', False):
+            # В режиме EXE – сам exe
+            exe_path = sys.executable
+        else:
+            # В режиме разработки – python gui.py
+            exe_path = sys.executable
+            # Для разработки запускаем gui.py с аргументом --server
+            # (но тогда нужно учесть, что gui.py будет запущен снова, что нежелательно)
+            # Поэтому лучше в разработке оставить старый способ или тоже использовать эту логику.
+            # Упростим: в разработке тоже будем использовать тот же подход
+            # (т.е. запускать python gui.py --server ...)
+            # Тогда наш код выше с проверкой --server сработает.
+    
+        cmd = [exe_path, '--server', '--port', str(port)]
+        if not getattr(sys, 'frozen', False):
+            # В режиме разработки нужно явно указать gui.py
+            cmd = [sys.executable, 'gui.py', '--server', '--port', str(port)]
+    
+        # Запускаем сервер как подпроцесс, скрывая окно (Windows)
+        creationflags = 0
+        if sys.platform == 'win32':
+            creationflags = subprocess.CREATE_NO_WINDOW  # или DETACHED_PROCESS
+    
         self.server_process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
-            universal_newlines=True
+            universal_newlines=True,
+            creationflags=creationflags
         )
-
-        # Запускаем поток для чтение вывода сервера
+    
+        # Запускаем поток для чтения вывода сервера
         threading.Thread(target=self.read_server_output, daemon=True).start()
-
+    
         self.start_server_btn.config(state='disabled')
         self.stop_server_btn.config(state='normal')
         self.append_server_log(f"Сервер запущен на порту {port}\n")
+    
 
     def stop_server(self):
         """Остановка сервера"""
